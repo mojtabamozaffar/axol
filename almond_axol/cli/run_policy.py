@@ -44,6 +44,7 @@ from .config import AggregateFn, LogLevel, PolicyType, parse
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    from ..lerobot.rerun_robot import AxolRerunRobot
     from ..lerobot.robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
@@ -132,6 +133,12 @@ class RunPolicyConfig:
     temporal_ensemble_coeff: float = 0.01
     rerun_ip: str | None = None
     rerun_port: int = 9876
+    # 3D task-space Rerun view (only active with --rerun_ip): the live robot,
+    # posed by forward kinematics from the current joint state, plus the
+    # predicted/commanded end-effector pose per arm. viz_blueprint also sends a
+    # default layout (3D | cameras | signals); disable it to keep your own.
+    viz_robot_3d: bool = True
+    viz_blueprint: bool = True
     # Shadow mode: the policy infers and streams its PREDICTED actions to Rerun,
     # but the robot never actuates — neither policy actions nor the between-
     # episode return-to-rest move the arms. Pair with --rerun_ip to watch what the
@@ -146,6 +153,18 @@ class RunPolicyConfig:
     # gravity-comp``. Ignored unless --shadow is set.
     shadow_gc_kd: float = 0.25
     shadow_gc_rate_hz: float = 250.0
+    # Rest pose for the between-episode return-to-rest, as 7-element joint-radian
+    # lists (SHOULDER_1 → WRIST_3), mirroring ``collect-data``'s
+    # ``teleop_config.vr_teleop_config.rest_pose_*``. ``None`` keeps the built-in
+    # default. Applies to powered runs and to shadow runs when
+    # ``--shadow_return_to_rest`` is set.
+    rest_pose_left: list[float] | None = None
+    rest_pose_right: list[float] | None = None
+    # Shadow mode normally never actuates. Set this to additionally perform the
+    # *trusted* collision-aware return-to-rest move (the policy still never
+    # drives) at the start of each episode, so you hand-guide from a known pose.
+    # The arms float in gravity comp between resets as usual.
+    shadow_return_to_rest: bool = False
     log_level: LogLevel = "INFO"
 
 
@@ -696,7 +715,23 @@ def _build_axol_robot_client(
             self._install_future_queue(future_queue)
 
         def _aggregate_action_queues(self, incoming_actions, aggregate_fn=None):  # type: ignore[no-untyped-def]
-            """Dispatch ``temporal_ensemble`` locally, else upstream scalar blends."""
+            """Dispatch ``temporal_ensemble`` locally, else upstream scalar blends.
+
+            Also stashes the raw predicted chunk (sorted by timestep, in the
+            robot's action space) on the publisher so the 3D viz can draw each
+            arm's predicted future-trajectory path. Runs for every strategy and
+            in shadow mode (only ``send_action`` is gated, not inference).
+            """
+            if incoming_actions and self._publisher is not None:
+                feats = list(self.robot.action_features)
+                chunk = [
+                    {
+                        key: float(ta.get_action()[i].item())
+                        for i, key in enumerate(feats)
+                    }
+                    for ta in sorted(incoming_actions, key=lambda a: a.get_timestep())
+                ]
+                self._publisher.publish_chunk(chunk)
             if self._aggregate_strategy == "temporal_ensemble":
                 return self._temporal_ensemble_aggregate(incoming_actions)
             return super()._aggregate_action_queues(incoming_actions, aggregate_fn)
@@ -870,6 +905,9 @@ def _run(
     shadow = cfg.shadow
     shadow_gc_kd = cfg.shadow_gc_kd
     shadow_gc_rate_hz = cfg.shadow_gc_rate_hz
+    shadow_return_to_rest = cfg.shadow_return_to_rest
+    rest_pose_left = cfg.rest_pose_left
+    rest_pose_right = cfg.rest_pose_right
     # Shadow mode is viz-only: a hand-guided observation paired with the policy's
     # *unexecuted* prediction is not a meaningful rollout, so never record one.
     if shadow and repo_id is not None:
@@ -967,8 +1005,30 @@ def _run(
                 vcodec=vcodec,
             )
 
+    robot_viz: "AxolRerunRobot | None" = None
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
+        # 3D task-space view: live robot (FK) + predicted EE per arm. Built once
+        # (logs the link meshes as static entities) and shared across episodes.
+        # Best-effort: a missing URDF / viz dep must not stop the run.
+        if cfg.viz_robot_3d:
+            try:
+                import rerun as rr
+
+                from ..lerobot.rerun_robot import (
+                    AxolRerunRobot,
+                    axol_run_policy_blueprint,
+                )
+
+                robot_viz = AxolRerunRobot(shadow=shadow)
+                if cfg.viz_blueprint:
+                    rr.send_blueprint(
+                        axol_run_policy_blueprint(list(robot.cameras.keys()))
+                    )
+                log_say("3D robot viz enabled (URDF + predicted end-effector).")
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("3D robot viz disabled: %s", exc)
+                robot_viz = None
 
     # Local inference (default): spawn the policy server and load the policy
     # BEFORE connecting cameras — the model download + CUDA load is a ~15 s
@@ -1004,12 +1064,34 @@ def _run(
         log_say(f"Using remote inference server at {server_host}:{server_port}.")
 
     # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
-    reset_controller = IKResetController()
+    reset_controller = IKResetController(
+        rest_pose_left=rest_pose_left,
+        rest_pose_right=rest_pose_right,
+    )
     reset_controller.start()
     log_say("Started IK reset worker (collision-aware return-to-rest).")
 
     client = None
     shadow_gc: ShadowGravityCompThread | None = None
+
+    def _shadow_reset_to_rest(message: str) -> None:
+        """Powered return-to-rest during a shadow run (opt-in via flag).
+
+        The policy still never drives — this is the trusted, collision-aware
+        reset trajectory only. Pauses the gravity-comp float so it doesn't
+        fight the stiff reset commands, clears the max-step guard (the arms may
+        have been hand-guided far from the last commanded pose while floating),
+        runs the reset, then resumes floating from the new pose.
+        """
+        log_say(message)
+        if shadow_gc is not None:
+            shadow_gc.pause()
+        try:
+            robot.reset_command_state()
+            reset_controller.return_to_rest(robot)
+        finally:
+            if shadow_gc is not None:
+                shadow_gc.resume()
     episodes_recorded = 0
     try:
         _wait_for_port(server_host, server_port, timeout=30.0)
@@ -1066,14 +1148,23 @@ def _run(
             robot.prepare_cartesian_actions()
 
         if shadow:
-            # Shadow never actuates, so the arms get no motion command and would
-            # otherwise hang limp. Float them in gravity comp instead, for the
-            # whole session, so they support their own weight and stay softly
-            # hand-guidable while the policy infers. Started before the first
-            # prompt so the arms are already compliant during scene setup.
+            # Optional trusted reset before floating: move to the rest pose so
+            # hand-guiding starts from a known configuration. The policy still
+            # never drives; this is the same collision-aware reset as a normal
+            # run. shadow_gc is not running yet, so no pause is needed.
+            if shadow_return_to_rest:
+                _shadow_reset_to_rest(
+                    "Shadow mode: moving to rest pose "
+                    "(trusted reset; policy does not drive)."
+                )
+            # Shadow never lets the policy actuate, so the arms get no motion
+            # command and would otherwise hang limp. Float them in gravity comp
+            # for the whole session so they support their own weight and stay
+            # softly hand-guidable while the policy infers. Started before the
+            # first prompt so the arms are already compliant during scene setup.
             log_say(
                 "Shadow mode: holding arms in gravity compensation "
-                "(soft, hand-guidable; not actuating)."
+                "(soft, hand-guidable; policy not actuating)."
             )
             shadow_gc = ShadowGravityCompThread(
                 robot=robot,
@@ -1133,6 +1224,7 @@ def _run(
                     task=task,
                     rerun_ip=rerun_ip,
                     shadow=shadow,
+                    robot_viz=robot_viz,
                 )
 
             control.begin_episode()
@@ -1207,10 +1299,16 @@ def _run(
                 if dataset is not None:
                     dataset.clear_episode_buffer()
                 if shadow:
-                    log_say(
-                        "Shadow mode: arms stay in gravity compensation "
-                        "(no rest move; still hand-guidable)."
-                    )
+                    if shadow_return_to_rest:
+                        _shadow_reset_to_rest(
+                            "Shadow mode: returning to rest pose "
+                            "(trusted reset; policy does not drive)."
+                        )
+                    else:
+                        log_say(
+                            "Shadow mode: arms stay in gravity compensation "
+                            "(no rest move; still hand-guidable)."
+                        )
                 else:
                     log_say("Returning to rest pose.")
                     reset_controller.return_to_rest(robot)
@@ -1226,10 +1324,16 @@ def _run(
             episodes_recorded += 1
             log_say(f"Saved episode {episodes_recorded}.")
             if shadow:
-                log_say(
-                    "Shadow mode: arms stay in gravity compensation "
-                    "(no rest move; still hand-guidable)."
-                )
+                if shadow_return_to_rest:
+                    _shadow_reset_to_rest(
+                        "Shadow mode: returning to rest pose "
+                        "(trusted reset; policy does not drive)."
+                    )
+                else:
+                    log_say(
+                        "Shadow mode: arms stay in gravity compensation "
+                        "(no rest move; still hand-guidable)."
+                    )
             else:
                 log_say("Returning to rest pose.")
                 reset_controller.return_to_rest(robot)
