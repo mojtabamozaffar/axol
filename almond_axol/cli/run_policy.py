@@ -37,6 +37,7 @@ from ..lerobot.rollout import (
     ActionPublisher,
     IKResetController,
     RolloutCaptureThread,
+    ShadowGravityCompThread,
 )
 from .config import AggregateFn, LogLevel, PolicyType, parse
 
@@ -137,6 +138,14 @@ class RunPolicyConfig:
     # policy wants to do on real observations before any powered run. No dataset is
     # recorded in shadow mode (--repo_id is ignored).
     shadow: bool = False
+    # Shadow-mode gravity compensation: instead of leaving the un-actuated arms
+    # limp, shadow mode holds them in gravity comp so they float and stay
+    # hand-guidable (soft, controllable motion). ``shadow_gc_kd`` is the
+    # per-joint velocity damping (Nm·s/rad; higher = more sluggish/damped) and
+    # ``shadow_gc_rate_hz`` the comp loop rate. Defaults match ``axol
+    # gravity-comp``. Ignored unless --shadow is set.
+    shadow_gc_kd: float = 0.25
+    shadow_gc_rate_hz: float = 250.0
     log_level: LogLevel = "INFO"
 
 
@@ -859,6 +868,8 @@ def _run(
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
     shadow = cfg.shadow
+    shadow_gc_kd = cfg.shadow_gc_kd
+    shadow_gc_rate_hz = cfg.shadow_gc_rate_hz
     # Shadow mode is viz-only: a hand-guided observation paired with the policy's
     # *unexecuted* prediction is not a meaningful rollout, so never record one.
     if shadow and repo_id is not None:
@@ -998,6 +1009,7 @@ def _run(
     log_say("Started IK reset worker (collision-aware return-to-rest).")
 
     client = None
+    shadow_gc: ShadowGravityCompThread | None = None
     episodes_recorded = 0
     try:
         _wait_for_port(server_host, server_port, timeout=30.0)
@@ -1054,7 +1066,21 @@ def _run(
             robot.prepare_cartesian_actions()
 
         if shadow:
-            log_say("Shadow mode: not moving to rest pose (arms will not move).")
+            # Shadow never actuates, so the arms get no motion command and would
+            # otherwise hang limp. Float them in gravity comp instead, for the
+            # whole session, so they support their own weight and stay softly
+            # hand-guidable while the policy infers. Started before the first
+            # prompt so the arms are already compliant during scene setup.
+            log_say(
+                "Shadow mode: holding arms in gravity compensation "
+                "(soft, hand-guidable; not actuating)."
+            )
+            shadow_gc = ShadowGravityCompThread(
+                robot=robot,
+                kd=shadow_gc_kd,
+                rate_hz=shadow_gc_rate_hz,
+            )
+            shadow_gc.start()
         else:
             log_say("Returning to rest pose.")
             reset_controller.return_to_rest(robot)
@@ -1181,7 +1207,10 @@ def _run(
                 if dataset is not None:
                     dataset.clear_episode_buffer()
                 if shadow:
-                    log_say("Shadow mode: not moving to rest pose.")
+                    log_say(
+                        "Shadow mode: arms stay in gravity compensation "
+                        "(no rest move; still hand-guidable)."
+                    )
                 else:
                     log_say("Returning to rest pose.")
                     reset_controller.return_to_rest(robot)
@@ -1197,7 +1226,10 @@ def _run(
             episodes_recorded += 1
             log_say(f"Saved episode {episodes_recorded}.")
             if shadow:
-                log_say("Shadow mode: not moving to rest pose.")
+                log_say(
+                    "Shadow mode: arms stay in gravity compensation "
+                    "(no rest move; still hand-guidable)."
+                )
             else:
                 log_say("Returning to rest pose.")
                 reset_controller.return_to_rest(robot)
@@ -1223,6 +1255,11 @@ def _run(
             pass
 
         log_say("Stopping.")
+        # Stop the shadow gravity-comp loop before disconnect so no comp command
+        # races the motor disable (disconnect engages the brakes / disables).
+        if shadow_gc is not None:
+            shadow_gc.stop_event.set()
+            shadow_gc.join(timeout=5.0)
         if client is not None:
             try:
                 client.stop()

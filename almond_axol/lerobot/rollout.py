@@ -11,6 +11,9 @@ the same episode plumbing without duplicating it:
 - :class:`RolloutCaptureThread` — fixed-rate thread that pairs a
   timestamp-aligned observation with the latest published action and
   appends it to a ``LeRobotDataset``.
+- :class:`ShadowGravityCompThread` — fixed-rate thread that holds the arms
+  in gravity compensation so they float and stay hand-guidable during a
+  shadow-mode run (which never actuates via ``send_action``).
 - :func:`stdin_watcher` — ``s`` / ``r`` / ``q`` keystroke watcher with
   no-block ``select`` polling.
 
@@ -311,6 +314,52 @@ class RolloutCaptureThread(threading.Thread):
                     log_rerun_data(observation=obs_processed, action=action)
 
             tick += 1
+
+
+class ShadowGravityCompThread(threading.Thread):
+    """Hold both arms in gravity compensation for the duration of a shadow run.
+
+    Shadow mode never actuates via ``send_action``, so without this loop the
+    arms would receive no torque command at all: enabled but commanded to
+    zero torque, they hang limp and sag under gravity. This thread ticks
+    :meth:`AxolRobot.gravity_compensate` at ``rate_hz`` so the arms instead
+    *float* — supporting their own weight while staying freely hand-guidable —
+    giving the operator soft, controllable motion to walk the scene through
+    the task while the policy infers on it. All seven arm joints are freed
+    each cycle (``free_joints=None``); the gripper is held softly.
+
+    It runs for the whole session — across episodes *and* the between-episode
+    reset prompts — so the arms stay compliant the entire time the operator is
+    hand-guiding or resetting the scene. ``gravity_compensate`` reads the
+    cached joint positions, so robot telemetry must be active (it is whenever
+    ``telemetry_hz > 0``, the default); a failed tick (e.g. a transient CAN
+    error) is logged and the loop continues rather than killing the run.
+    """
+
+    def __init__(
+        self,
+        *,
+        robot: "AxolRobot",
+        kd: float = 0.25,
+        rate_hz: float = 250.0,
+    ) -> None:
+        super().__init__(name="axol-shadow-gravity-comp", daemon=True)
+        self.robot = robot
+        self.kd = kd
+        self.rate_hz = rate_hz
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        dt = 1.0 / self.rate_hz
+        while not self.stop_event.is_set():
+            loop_start = time.perf_counter()
+            try:
+                self.robot.gravity_compensate(kd=self.kd)
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("Shadow gravity-comp tick failed (%s).", exc)
+            wait_s = dt - (time.perf_counter() - loop_start)
+            if wait_s > 0 and self.stop_event.wait(timeout=wait_s):
+                return
 
 
 def stdin_watcher(

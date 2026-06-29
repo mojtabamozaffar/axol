@@ -32,11 +32,21 @@ Use it:
 ## 3. What it does to behavior (the safety contract)
 
 When `--shadow` is set:
-- **No actuation, ever.** Every call that could move the arms is gated:
+- **No actuation, ever.** Every call that could *drive* the arms is gated:
   - the policy action in the control loop (`send_action` is skipped), and
   - the between-episode **return-to-rest** trajectory (all three call sites: initial,
     re-record `r`, and save `s`).
-  So episode transitions don't move the arms either.
+  So episode transitions don't drive the arms either.
+- **Arms float in gravity compensation.** Because shadow never sends a motion command,
+  the enabled motors would otherwise sit at zero torque and the arms would hang limp and
+  sag under their own weight. Instead, a background loop holds them in gravity
+  compensation (`AxolRobot.gravity_compensate`, all 7 joints free) for the whole session —
+  during episodes *and* the between-episode reset prompts — so the arms support their own
+  weight and stay softly hand-guidable (the "compliant arms" of §6). Tunables:
+  `--shadow_gc_kd` (velocity damping, Nm·s/rad; higher = more damped) and
+  `--shadow_gc_rate_hz` (loop rate); defaults (`0.25` / `250`) match `axol gravity-comp`.
+  This is still *not* actuation toward any policy target — the arms only ever follow your
+  hand, supported against gravity.
 - **Predicted actions are visualized.** The policy's intended joint targets are logged to
   Rerun under the **`action.predicted.*`** namespace, alongside the current joints under
   **`observation.state`** — so you can compare "what the policy wants" vs. "where the arm
@@ -56,9 +66,13 @@ The feature is two functional files (in `shadow_mode.patch`) plus one optional d
 
 | File | Change |
 |---|---|
-| `almond_axol/cli/run_policy.py` | `RunPolicyConfig.shadow` flag; thread it through the client builder + `AxolRobotClient`; gate `send_action` in `control_loop_action`; gate the 3 `return_to_rest` calls; force viz-only (ignore `--repo_id`); run the capture thread in shadow even without a dataset. |
-| `almond_axol/lerobot/rollout.py` | `RolloutCaptureThread` accepts `dataset=None` (skip recording) + a `shadow` flag; logs the predicted action under `action.predicted.*`. |
-| `docs/cli/run-policy.mdx` | *(optional, cosmetic)* a `--shadow` row in the flag table. |
+| `almond_axol/cli/run_policy.py` | `RunPolicyConfig.shadow` flag (+ `shadow_gc_kd` / `shadow_gc_rate_hz`); thread it through the client builder + `AxolRobotClient`; gate `send_action` in `control_loop_action`; gate the 3 `return_to_rest` calls; force viz-only (ignore `--repo_id`); run the capture thread in shadow even without a dataset; start/stop the gravity-comp thread for the session. |
+| `almond_axol/lerobot/rollout.py` | `RolloutCaptureThread` accepts `dataset=None` (skip recording) + a `shadow` flag; logs the predicted action under `action.predicted.*`. Adds `ShadowGravityCompThread` — a fixed-rate loop that holds the arms in gravity comp so they float and stay hand-guidable. |
+| `docs/cli/run-policy.mdx` | a `--shadow` row in the flag table. |
+
+> **Note:** the gravity-comp behavior is *not* in `shadow_mode.patch` (which left the arms
+> limp); it was added afterward so hand-guiding actually works. Apply the changes by hand
+> from the files above if replicating on the Zed box.
 
 **Built against axol commit `aeadfc54`** ("Add --joints filter to can.receive diagnostic
 (#93)", 2026-06-27).
@@ -118,19 +132,26 @@ axol run-policy --shadow \
 (`--policy_path` is the path **on the GPU desktop** — the server loads it from its own disk.)
 
 **What to expect / how to read it**
-- The arms **do not move**. The policy keeps inferring on the live scene.
+- The arms **do not drive themselves** — the policy never actuates. They are held in
+  gravity compensation, so they **float**: they hold their own weight and follow your hand
+  with light, controllable effort. (If an arm instead feels limp and sags, gravity comp
+  isn't running — see §9.) The policy keeps inferring on the live scene throughout.
 - Hand-guide the compliant arms through the task. In Rerun, watch `action.predicted.*`
   (the policy's intended joint targets) move toward the goal and compare against
   `observation.state` (current joints). Confirm the predictions are sensible, not
   constant / NaN / wildly out of range. Note: predictions lag the scene by the inference
   latency (~tens of ms) — expected.
-- `s` / `r` / `q` and `--episode_time_s` work as usual; nothing is recorded.
+- If the float feels too loose or too sluggish, tune `--shadow_gc_kd` (raise for more
+  damping). `s` / `r` / `q` and `--episode_time_s` work as usual; nothing is recorded, and
+  the arms stay compliant across episode transitions.
 
 ## 7. Acceptance test (do this once, before trusting it)
 
 With the motors **powered**: run the command above, let it infer for a while, and press
-`r` to cycle an episode. **Confirm the arms never move** — neither during inference nor on
-the episode transition. That proves the gate. Only then proceed to a powered run.
+`r` to cycle an episode. **Confirm the arms never drive toward a target** — they should
+only ever float under your hand, never move on their own, neither during inference nor on
+the episode transition. (Releasing an arm should leave it gravity-supported, not driving
+anywhere.) That proves the gate. Only then proceed to a powered run.
 
 ## 8. Safe-deployment sequence (shadow mode is step 4)
 
@@ -150,7 +171,14 @@ the episode transition. That proves the gate. Only then proceed to a powered run
 
 - **Not an e-stop replacement.** There is no software e-stop in `run-policy`; the aborts are
   the `q` key, a short `--episode_time_s`, and the physical e-stop. Shadow mode removes
-  motion risk only because it never actuates.
+  *driven*-motion risk only because it never actuates toward a target; the gravity-comp
+  hold still energizes the motors (the arms hold position / follow your hand). Keep the
+  physical e-stop within reach.
+- **Gravity comp needs telemetry + decent mass tuning.** The float relies on active robot
+  telemetry (the default `telemetry_hz 120` is fine; don't set it to `0` in shadow) and on
+  the per-joint `mass`/`com` values being roughly right — the same values `axol
+  gravity-comp` depends on. Badly tuned masses make the arm drift up or sag; tune them as
+  you would for `gravity-comp`, and raise `--shadow_gc_kd` if the float feels loose.
 - **Server dependency.** Shadow still needs the GPU-desktop `inference-server` up (and its
   HF/PaliGemma access) — it exercises the *real* serving path on purpose.
 - **Version match.** The patch applies cleanly only at axol `aeadfc54`; otherwise apply by

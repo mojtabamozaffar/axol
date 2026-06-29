@@ -36,7 +36,9 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--robot_config.axol_config.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7-element list (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. Should match the value used at data collection time. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--rerun_ip IP` | IP of a Rerun viewer on your local machine for live visualization |
 | `--rerun_port INT` | Rerun viewer port (default: 9876); only used when `--rerun_ip` is set |
-| `--shadow` | Shadow mode: the policy infers on real observations and streams its **predicted** actions to Rerun (under `action.predicted.*`), but the robot never actuates — neither policy actions nor the between-episode return-to-rest move the arms. Pair with `--rerun_ip` to preview what the policy wants to do before any powered run. No dataset is recorded (`--repo_id` is ignored). |
+| `--shadow` | Shadow mode: the policy infers on real observations and streams its **predicted** actions to Rerun (under `action.predicted.*`), but the robot never actuates toward them — neither policy actions nor the between-episode return-to-rest drive the arms. Instead the arms are held in gravity compensation so they float and stay softly hand-guidable for the whole session. Pair with `--rerun_ip` to preview what the policy wants to do before any powered run. No dataset is recorded (`--repo_id` is ignored). |
+| `--shadow_gc_kd FLOAT` | Velocity damping (Nm·s/rad) for the shadow-mode gravity-comp hold; higher = more damped/sluggish. Default `0.25`. Only used with `--shadow`. |
+| `--shadow_gc_rate_hz FLOAT` | Loop rate (Hz) of the shadow-mode gravity-comp hold. Default `250`. Only used with `--shadow`. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
 
