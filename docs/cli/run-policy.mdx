@@ -36,6 +36,9 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--robot_config.axol_config.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7-element list (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. Should match the value used at data collection time. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--rerun_ip IP` | IP of a Rerun viewer on your local machine for live visualization |
 | `--rerun_port INT` | Rerun viewer port (default: 9876); only used when `--rerun_ip` is set |
+| `--viz_robot_3d true\|false` | Add a **3D task-space view** to the Rerun stream (default: on; only active with `--rerun_ip`): the live robot, posed by forward kinematics from the current joint state, plus, per arm, the policy's predicted/commanded end-effector pose (point + orientation triad, with a line back to where the arm actually is) **and the predicted future-trajectory path** — FK of the whole action chunk (next ~50 predictions), drawn as a fading polyline. Left = blue, right = orange. Falls back gracefully if the URDF / viz deps are missing. |
+| `--viz_blueprint true\|false` | Send a default Rerun layout — **3D ∣ camera grid ∣ scalar signals** — alongside the 3D view (default: on). Disable to keep your own viewer layout. |
+| `--shadow` | **Shadow mode (no actuation).** The policy infers on live observations and its *predicted* actions stream to Rerun (under `action.predicted.*`), but the robot never moves — neither policy actions nor the between-episode return-to-rest. Use with `--rerun_ip` to vet a policy on real scenes before any powered run; hand-guide the (compliant) arms through the task and compare predicted-vs-current. No dataset is recorded (`--repo_id` is ignored). Default: off. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
 
@@ -54,4 +57,10 @@ If `--repo_id` is supplied, each saved episode is appended to a LeRobot-format d
 
 <Info>
   Action chunk aggregation defaults to ACT's Algorithm 2 (`temporal_ensemble`): every future timestep covered by the buffered chunks is the exponentially-weighted average across those chunks, with the gripper indices snapped to the newest contributing chunk so bang-bang grasp commands aren't smeared. The control loop and observation send run on separate threads — decoupling the ~60-70 ms ZED-read + gRPC send from the 60 Hz action stream that would otherwise collapse to ~27 Hz on the upstream single-threaded design.
+</Info>
+
+<Info>
+  **3D task-space view.** With `--rerun_ip` set, `run-policy` adds a live 3D scene to Rerun (toggle with `--viz_robot_3d`). The robot is posed by forward kinematics from the current joint state (`robot/<link>`), and per arm: `ee/<side>/predicted` (the immediate predicted EE — point + orientation triad), `ee/<side>/current` (a dim point at the actual gripper), `ee/<side>/reach` (a line between them), and **`ee/<side>/path` — the predicted future trajectory**, i.e. FK of the policy's full action chunk (the next ~50 predictions) drawn as a polyline that fades along the horizon. The path is recomputed once per inference (not per tick) and persists between chunks. For a joint-space policy these are the FK of the predicted joint angles; for a Cartesian policy (`observe_cartesian`) the actions already are EE poses and are read directly. Pair with `--shadow` to watch where the policy *wants* to move both hands over the next chunk, in metres, against the live (hand-guided) robot — without actuating it. FK uses the bundled URDF via `yourdfpy` and stays on the CPU.
+
+  Verify the path rendering on recorded data with `experiments/evaluation/viz_episode.py`, which replays a ground-truth episode through this exact renderer, mocking the predicted chunk with the next ~50 ground-truth actions.
 </Info>

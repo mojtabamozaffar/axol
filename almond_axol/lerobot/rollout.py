@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.types import RobotAction
 
+    from .rerun_robot import AxolRerunRobot
     from .robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
@@ -189,12 +190,19 @@ class ActionPublisher:
     Updated by the control loop after every ``robot.send_action`` call,
     read by :class:`RolloutCaptureThread` to pair each dataset frame with
     the action that drove the robot at that tick.
+
+    Also carries the most recent *predicted action chunk* (the policy's raw
+    next-N prediction), versioned so the capture thread can redraw the 3D
+    future-trajectory path only when a fresh chunk arrives instead of every
+    tick. The chunk is independent of the per-tick ``latest`` action.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._latest: "RobotAction | None" = None
         self._first_event = threading.Event()
+        self._chunk: "list[RobotAction] | None" = None
+        self._chunk_version = 0
 
     def publish(self, action: "RobotAction") -> None:
         snap = dict(action)
@@ -206,12 +214,27 @@ class ActionPublisher:
         with self._lock:
             return None if self._latest is None else dict(self._latest)
 
+    def publish_chunk(self, chunk: "list[RobotAction]") -> None:
+        """Store the latest predicted action chunk (for the 3D path viz)."""
+        snap = [dict(a) for a in chunk]
+        with self._lock:
+            self._chunk = snap
+            self._chunk_version += 1
+
+    def latest_chunk(self) -> "tuple[int, list[RobotAction] | None]":
+        """Return ``(version, chunk_copy)``; version changes on each new chunk."""
+        with self._lock:
+            if self._chunk is None:
+                return self._chunk_version, None
+            return self._chunk_version, [dict(a) for a in self._chunk]
+
     def wait_for_first(self, timeout: float) -> bool:
         return self._first_event.wait(timeout=timeout)
 
     def reset(self) -> None:
         with self._lock:
             self._latest = None
+            self._chunk = None
         self._first_event.clear()
 
 
@@ -221,6 +244,16 @@ class RolloutCaptureThread(threading.Thread):
     Each tick samples a global-timestamp-aligned observation via
     ``AxolRobot.get_observation`` and pairs it with the latest action
     published by the control loop.
+
+    ``dataset`` may be ``None`` (shadow mode): the row is then only streamed
+    to Rerun, never recorded. When ``shadow`` is set the published action is
+    the policy's *predicted* (unexecuted) action, logged under a distinct
+    ``predicted.*`` namespace to set it apart from an executed-action run.
+
+    ``robot_viz`` (optional) adds a 3D task-space view to the Rerun stream: the
+    live robot posed by forward kinematics from the current joint state, plus
+    the predicted/commanded end-effector pose per arm. It only fires when
+    ``rerun_ip`` is set.
     """
 
     def __init__(
@@ -228,11 +261,13 @@ class RolloutCaptureThread(threading.Thread):
         *,
         publisher: ActionPublisher,
         robot: "AxolRobot",
-        dataset: "LeRobotDataset",
+        dataset: "LeRobotDataset | None",
         robot_obs_proc: Callable[[Any], Any],
         fps: int,
         task: str,
         rerun_ip: str | None,
+        shadow: bool = False,
+        robot_viz: "AxolRerunRobot | None" = None,
     ) -> None:
         super().__init__(name="axol-rollout-capture", daemon=True)
         self.publisher = publisher
@@ -242,6 +277,9 @@ class RolloutCaptureThread(threading.Thread):
         self.fps = fps
         self.task = task
         self.rerun_ip = rerun_ip
+        self.shadow = shadow
+        self.robot_viz = robot_viz
+        self._last_chunk_version = -1
         self.stop_event = threading.Event()
 
     def run(self) -> None:
@@ -283,18 +321,48 @@ class RolloutCaptureThread(threading.Thread):
                 continue
 
             obs_processed = self.robot_obs_proc(obs)
-            obs_frame = build_dataset_frame(
-                self.dataset.features, obs_processed, prefix=OBS_STR
-            )
-            act_frame = build_dataset_frame(
-                self.dataset.features, action, prefix=ACTION
-            )
-            if self.stop_event.is_set():
-                return
-            self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
+            if self.dataset is not None:
+                obs_frame = build_dataset_frame(
+                    self.dataset.features, obs_processed, prefix=OBS_STR
+                )
+                act_frame = build_dataset_frame(
+                    self.dataset.features, action, prefix=ACTION
+                )
+                if self.stop_event.is_set():
+                    return
+                self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
 
             if self.rerun_ip:
-                log_rerun_data(observation=obs_processed, action=action)
+                if self.shadow:
+                    # The policy's unexecuted wish — log under action.predicted.*
+                    # so it reads distinctly from a normal executed-action run.
+                    predicted = {f"predicted.{k}": v for k, v in action.items()}
+                    log_rerun_data(observation=obs_processed, action=predicted)
+                else:
+                    log_rerun_data(observation=obs_processed, action=action)
+
+                # 3D task-space view: live robot (FK from current joints), the
+                # predicted/commanded EE pose per arm, and the predicted future
+                # trajectory path per arm (from the latest action chunk). Only
+                # pass a chunk when it changed, so the ~50-pose path FK runs once
+                # per inference, not every tick (the path persists between chunks).
+                # Best-effort — a viz hiccup must never disturb the capture loop.
+                if self.robot_viz is not None:
+                    try:
+                        left_pos, right_pos = self.robot.positions
+                        version, chunk = self.publisher.latest_chunk()
+                        new_chunk = None
+                        if chunk is not None and version != self._last_chunk_version:
+                            new_chunk = chunk
+                            self._last_chunk_version = version
+                        self.robot_viz.log_frame(
+                            left_pos=left_pos,
+                            right_pos=right_pos,
+                            action=action,
+                            action_chunk=new_chunk,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _logger.debug("3D robot viz tick %d failed: %s", tick, exc)
 
             tick += 1
 

@@ -43,6 +43,7 @@ from .config import AggregateFn, LogLevel, PolicyType, parse
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    from ..lerobot.rerun_robot import AxolRerunRobot
     from ..lerobot.robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
@@ -131,6 +132,18 @@ class RunPolicyConfig:
     temporal_ensemble_coeff: float = 0.01
     rerun_ip: str | None = None
     rerun_port: int = 9876
+    # 3D task-space Rerun view (only active with --rerun_ip): the live robot,
+    # posed by forward kinematics from the current joint state, plus the
+    # predicted/commanded end-effector pose per arm. viz_blueprint also sends a
+    # default layout (3D | cameras | signals); disable it to keep your own.
+    viz_robot_3d: bool = True
+    viz_blueprint: bool = True
+    # Shadow mode: the policy infers and streams its PREDICTED actions to Rerun,
+    # but the robot never actuates — neither policy actions nor the between-
+    # episode return-to-rest move the arms. Pair with --rerun_ip to watch what the
+    # policy wants to do on real observations before any powered run. No dataset is
+    # recorded in shadow mode (--repo_id is ignored).
+    shadow: bool = False
     log_level: LogLevel = "INFO"
 
 
@@ -354,6 +367,7 @@ def _build_axol_robot_client(
     publisher: ActionPublisher,
     aggregate_strategy: str = "temporal_ensemble",
     temporal_ensemble_coeff: float = 0.01,
+    shadow: bool = False,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 
@@ -365,6 +379,8 @@ def _build_axol_robot_client(
         publisher: Sink for executed actions, drained by the capture thread.
         aggregate_strategy: One of the ``--aggregate_fn`` choices.
         temporal_ensemble_coeff: Decay coefficient for temporal_ensemble.
+        shadow: If True, never call ``robot.send_action`` — publish the
+            PREDICTED action for Rerun viz instead (no actuation).
     """
     import threading as _threading
     from queue import Queue
@@ -426,6 +442,7 @@ def _build_axol_robot_client(
             publisher,
             aggregate_strategy,
             temporal_ensemble_coeff,
+            shadow=False,
         ):
             # We override the private RobotClient._aggregate_action_queues to
             # inject temporal_ensemble (no public hook can express it — see the
@@ -453,6 +470,8 @@ def _build_axol_robot_client(
                 if key.endswith("gripper.pos")
             )
             self._publisher = publisher
+            # Shadow mode: gate every send_action so the arms never move.
+            self._shadow = bool(shadow)
             self._aggregate_strategy = aggregate_strategy
             self._temporal_ensemble_coeff = float(temporal_ensemble_coeff)
             # ``(origin, packed_actions, timestamp)`` per chunk, sorted
@@ -675,7 +694,23 @@ def _build_axol_robot_client(
             self._install_future_queue(future_queue)
 
         def _aggregate_action_queues(self, incoming_actions, aggregate_fn=None):  # type: ignore[no-untyped-def]
-            """Dispatch ``temporal_ensemble`` locally, else upstream scalar blends."""
+            """Dispatch ``temporal_ensemble`` locally, else upstream scalar blends.
+
+            Also stashes the raw predicted chunk (sorted by timestep, in the
+            robot's action space) on the publisher so the 3D viz can draw each
+            arm's predicted future-trajectory path. Runs for every strategy and
+            in shadow mode (only ``send_action`` is gated, not inference).
+            """
+            if incoming_actions and self._publisher is not None:
+                feats = list(self.robot.action_features)
+                chunk = [
+                    {
+                        key: float(ta.get_action()[i].item())
+                        for i, key in enumerate(feats)
+                    }
+                    for ta in sorted(incoming_actions, key=lambda a: a.get_timestep())
+                ]
+                self._publisher.publish_chunk(chunk)
             if self._aggregate_strategy == "temporal_ensemble":
                 return self._temporal_ensemble_aggregate(incoming_actions)
             return super()._aggregate_action_queues(incoming_actions, aggregate_fn)
@@ -704,12 +739,20 @@ def _build_axol_robot_client(
                 key: action_tensor[i].item()
                 for i, key in enumerate(self.robot.action_features)
             }
-            performed = self.robot.send_action(action)
+            if self._shadow:
+                # Shadow mode: NEVER actuate. Publish the PREDICTED action so the
+                # capture thread can visualize it in Rerun against current state.
+                performed = None
+                if self._publisher is not None:
+                    self._publisher.publish(action)
+            else:
+                performed = self.robot.send_action(action)
 
             if verbose:
                 self.logger.debug(
                     f"Ts={timed_action.get_timestamp()} | "
-                    f"Action #{timed_action.get_timestep()} performed | "
+                    f"Action #{timed_action.get_timestep()} "
+                    f"{'predicted (shadow)' if self._shadow else 'performed'} | "
                     f"Queue size: {qs_after}"
                 )
 
@@ -785,6 +828,7 @@ def _build_axol_robot_client(
         publisher,
         aggregate_strategy,
         temporal_ensemble_coeff,
+        shadow,
     )
 
 
@@ -837,6 +881,12 @@ def _run(
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
+    shadow = cfg.shadow
+    # Shadow mode is viz-only: a hand-guided observation paired with the policy's
+    # *unexecuted* prediction is not a meaningful rollout, so never record one.
+    if shadow and repo_id is not None:
+        log_say("Shadow mode: ignoring --repo_id (no dataset is recorded).")
+        repo_id = None
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the
@@ -929,8 +979,30 @@ def _run(
                 vcodec=vcodec,
             )
 
+    robot_viz: "AxolRerunRobot | None" = None
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
+        # 3D task-space view: live robot (FK) + predicted EE per arm. Built once
+        # (logs the link meshes as static entities) and shared across episodes.
+        # Best-effort: a missing URDF / viz dep must not stop the run.
+        if cfg.viz_robot_3d:
+            try:
+                import rerun as rr
+
+                from ..lerobot.rerun_robot import (
+                    AxolRerunRobot,
+                    axol_run_policy_blueprint,
+                )
+
+                robot_viz = AxolRerunRobot(shadow=shadow)
+                if cfg.viz_blueprint:
+                    rr.send_blueprint(
+                        axol_run_policy_blueprint(list(robot.cameras.keys()))
+                    )
+                log_say("3D robot viz enabled (URDF + predicted end-effector).")
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("3D robot viz disabled: %s", exc)
+                robot_viz = None
 
     # Local inference (default): spawn the policy server and load the policy
     # BEFORE connecting cameras — the model download + CUDA load is a ~15 s
@@ -1007,6 +1079,7 @@ def _run(
             publisher=publisher,
             aggregate_strategy=aggregate_fn,
             temporal_ensemble_coeff=temporal_ensemble_coeff,
+            shadow=shadow,
         )
 
         log_say("Loading policy on server (one-time)...")
@@ -1024,8 +1097,11 @@ def _run(
             log_say("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()
 
-        log_say("Returning to rest pose.")
-        reset_controller.return_to_rest(robot)
+        if shadow:
+            log_say("Shadow mode: not moving to rest pose (arms will not move).")
+        else:
+            log_say("Returning to rest pose.")
+            reset_controller.return_to_rest(robot)
         if not control.await_continue(
             "Reset the scene, then press Enter to start the first episode."
         ):
@@ -1062,8 +1138,10 @@ def _run(
                 daemon=True,
             )
 
+            # In shadow mode there is no dataset, but we still run the capture
+            # thread so the policy's predicted action streams to Rerun.
             capture: RolloutCaptureThread | None = None
-            if dataset is not None:
+            if dataset is not None or shadow:
                 capture = RolloutCaptureThread(
                     publisher=publisher,
                     robot=robot,
@@ -1072,6 +1150,8 @@ def _run(
                     fps=fps,
                     task=task,
                     rerun_ip=rerun_ip,
+                    shadow=shadow,
+                    robot_viz=robot_viz,
                 )
 
             control.begin_episode()
@@ -1145,8 +1225,11 @@ def _run(
                 log_say("Re-recording episode.")
                 if dataset is not None:
                     dataset.clear_episode_buffer()
-                log_say("Returning to rest pose.")
-                reset_controller.return_to_rest(robot)
+                if shadow:
+                    log_say("Shadow mode: not moving to rest pose.")
+                else:
+                    log_say("Returning to rest pose.")
+                    reset_controller.return_to_rest(robot)
                 if not control.await_continue(
                     "Reset the scene, then press Enter to start."
                 ):
@@ -1158,8 +1241,11 @@ def _run(
                 dataset.save_episode()
             episodes_recorded += 1
             log_say(f"Saved episode {episodes_recorded}.")
-            log_say("Returning to rest pose.")
-            reset_controller.return_to_rest(robot)
+            if shadow:
+                log_say("Shadow mode: not moving to rest pose.")
+            else:
+                log_say("Returning to rest pose.")
+                reset_controller.return_to_rest(robot)
             if not control.await_continue(
                 "Reset the scene, then press Enter to start the next episode."
             ):
