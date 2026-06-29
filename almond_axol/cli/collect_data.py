@@ -546,6 +546,10 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     # runs on the robot's event loop, so a KeyboardInterrupt on the main thread
     # can't break it directly — it has to exit via this flag before teardown.
     loop_stop = threading.Event()
+    # Set to abort the end-of-session return-to-zero move (a second Ctrl+C):
+    # unlike loop_stop (already set during shutdown) the zero loop watches this
+    # so it isn't aborted by the very stop that triggers it.
+    zero_abort = threading.Event()
 
     def _stopped() -> bool:
         return (stop_event is not None and stop_event.is_set()) or loop_stop.is_set()
@@ -677,6 +681,25 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             await robot.send_action_async(robot_action_proc((act, joint_obs)))
             await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
 
+    async def _zero_loop() -> None:
+        # Drive the end-of-session return-to-zero trajectory to completion.
+        # Unlike _reset_loop this does NOT bail on _stopped() — that flag is
+        # already set during shutdown, which is exactly when this runs — so it
+        # instead plays out until the move finishes (is_resetting goes false) or
+        # a hard time cap elapses, watching zero_abort for a second Ctrl+C.
+        zero_deadline = time.perf_counter() + 30.0
+        deadline = time.perf_counter()
+        while (
+            teleop.is_resetting
+            and not zero_abort.is_set()
+            and time.perf_counter() < zero_deadline
+        ):
+            deadline += teleop_interval
+            joint_obs = robot.get_joint_observation()
+            act = teleop.get_action()
+            await robot.send_action_async(robot_action_proc((act, joint_obs)))
+            await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+
     def _run_on_robot_loop(coro: Any) -> Any:
         """Run ``coro`` on the robot's event loop and block until it returns.
 
@@ -694,6 +717,37 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 fut.cancel()
             raise
 
+    def _return_to_zero() -> None:
+        """Gradually move both arms to the all-zeros pose before teardown.
+
+        Reuses the rest-pose return mechanism (a collision-aware IK trajectory
+        played back through the smoothing filters), but targets zero, so the
+        arms descend smoothly instead of dropping the instant ``disconnect()``
+        releases the motors. Best-effort: a second Ctrl+C, a missing connection,
+        or any failure abandons the move and proceeds to teardown.
+        """
+        if not (robot.is_connected and teleop.is_connected):
+            return
+        log_say("Returning to zero pose.")
+        teleop.request_zero()
+        fut = asyncio.run_coroutine_threadsafe(_zero_loop(), robot.event_loop)
+        try:
+            fut.result()
+        except KeyboardInterrupt:
+            # Second Ctrl+C: abort the move and wait for the loop to unwind so
+            # it stops commanding the robot before teardown.
+            zero_abort.set()
+            try:
+                fut.result(timeout=5.0)
+            except BaseException:
+                fut.cancel()
+        except Exception as exc:  # noqa: BLE001 - never block teardown
+            _logger.warning("return-to-zero move failed: %s", exc)
+
+    # True once the session ended cleanly (Ctrl+C or stop_event), as opposed to
+    # an unexpected error — gates the graceful return-to-zero, which should not
+    # run when the robot may be faulted.
+    graceful_stop = False
     try:
         while not _stopped():
             episode_idx = recorder.episode_count()
@@ -738,13 +792,20 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 log_say("Episode ended before recording started, skipping.")
             teleop.send_feedback_state(VRState.DATA_COLLECTION)
 
+        graceful_stop = True
     except KeyboardInterrupt:
-        pass
+        graceful_stop = True
     except Exception:
         teleop.send_feedback_error()
         raise
     finally:
         log_say("Stopping.")
+
+        # Park the arms at zero before releasing the motors so they descend
+        # gradually instead of dropping. Only on a clean stop — after an
+        # unexpected error the robot may be faulted and unsafe to command.
+        if graceful_stop:
+            _return_to_zero()
 
         if diag is not None:
             diag.stop()

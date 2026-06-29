@@ -520,10 +520,19 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
-                traj = worker.compute_reset_trajectory(q_current, q_rest)
+                # Optional explicit target (msg[2]); None/absent → rest pose.
+                # collect-data sends an all-zeros arm pose here to park the arms
+                # at end of session; the 2-tuple form (e.g. the policy reset in
+                # rollout.py) keeps returning to the configured rest pose.
+                q_target = (
+                    np.asarray(msg[2], dtype=np.float32)
+                    if len(msg) > 2 and msg[2] is not None
+                    else q_rest
+                )
+                traj = worker.compute_reset_trajectory(q_current, q_target)
                 worker.reset()
-                q = traj[-1].copy() if traj else q_rest.copy()
-                conn.send(("reset_traj", q_rest.copy(), traj))
+                q = traj[-1].copy() if traj else q_target.copy()
+                conn.send(("reset_traj", q_target.copy(), traj))
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
                 conn.send(q.copy())
