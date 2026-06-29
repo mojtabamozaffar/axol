@@ -464,6 +464,15 @@ def run_ik_worker(
     q_current_right: np.ndarray | None = None,
 ) -> None:
     """IK subprocess entry point."""
+    # Ignore Ctrl+C here: a terminal SIGINT reaches the whole process group, but
+    # this worker's lifecycle is owned by the parent (it stops on the `None`
+    # sentinel / pipe EOF sent at disconnect). Without this it would exit on
+    # Ctrl+C, and the parent's graceful return-to-zero — which needs this worker
+    # to plan the trajectory — would fail with a broken pipe and drop the arms.
+    from ..utils.signals import ignore_sigint
+
+    ignore_sigint()
+
     # Confine the JAX solve to a single core's worth of compute. The per-arm IK
     # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
     # core for each solve; combined with this process's nice(-10) boost, that
