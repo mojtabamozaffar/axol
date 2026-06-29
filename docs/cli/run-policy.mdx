@@ -39,6 +39,8 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--shadow` | Shadow mode: the policy infers on real observations and streams its **predicted** actions to Rerun (under `action.predicted.*`), but the robot never actuates toward them — neither policy actions nor the between-episode return-to-rest drive the arms. Instead the arms are held in gravity compensation so they float and stay softly hand-guidable for the whole session. Pair with `--rerun_ip` to preview what the policy wants to do before any powered run. No dataset is recorded (`--repo_id` is ignored). |
 | `--shadow_gc_kd FLOAT` | Velocity damping (Nm·s/rad) for the shadow-mode gravity-comp hold; higher = more damped/sluggish. Default `0.25`. Only used with `--shadow`. |
 | `--shadow_gc_rate_hz FLOAT` | Loop rate (Hz) of the shadow-mode gravity-comp hold. Default `250`. Only used with `--shadow`. |
+| `--rest_pose_left "[...]"` / `--rest_pose_right "[...]"` | Rest pose for the between-episode return-to-rest, as 7-element joint-radian lists (`SHOULDER_1`→`WRIST_3`), mirroring `collect-data`'s `teleop_config.vr_teleop_config.rest_pose_*`. Default: built-in rest pose. |
+| `--shadow_return_to_rest` | In `--shadow`, also perform the trusted collision-aware return-to-rest move at the start of each episode (the policy still never drives), so you hand-guide from a known pose; the arms float in gravity comp between resets. **Off by default** — when on, the arms *do* move under power at episode boundaries. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
 

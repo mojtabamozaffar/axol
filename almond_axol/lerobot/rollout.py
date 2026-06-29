@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.types import RobotAction
 
+    from .rerun_robot import AxolRerunRobot
     from .robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
@@ -53,11 +54,35 @@ class IKResetController:
     so the IK JIT overlaps with the policy load.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        rest_pose_left: list[float] | None = None,
+        rest_pose_right: list[float] | None = None,
+    ) -> None:
+        import numpy as np
+
         from ..kinematics.config import KinematicsConfig
         from ..teleop.config import VRTeleopConfig
 
+        # Start from the teleop defaults, then override the rest pose if the
+        # caller supplied one (e.g. ``run-policy --rest_pose_left/right``), so
+        # powered resets land in the same pose the demos were collected from.
+        # The IK worker reads these off ``vr_cfg`` and pre-settles them to a
+        # manipulability-balanced fixed point, exactly as in teleop/collect-data.
         self._vr_cfg = VRTeleopConfig()
+        for name, pose in (
+            ("rest_pose_left", rest_pose_left),
+            ("rest_pose_right", rest_pose_right),
+        ):
+            if pose is None:
+                continue
+            if len(pose) != len(ARM_JOINTS):
+                raise ValueError(
+                    f"{name} must have {len(ARM_JOINTS)} elements "
+                    f"(one per arm joint), got {len(pose)}"
+                )
+            setattr(self._vr_cfg, name, np.asarray(pose, dtype=np.float32))
         self._kin_cfg = KinematicsConfig()
         self._proc: Any | None = None
         self._conn: Any | None = None
@@ -192,12 +217,19 @@ class ActionPublisher:
     Updated by the control loop after every ``robot.send_action`` call,
     read by :class:`RolloutCaptureThread` to pair each dataset frame with
     the action that drove the robot at that tick.
+
+    Also carries the most recent *predicted action chunk* (the policy's raw
+    next-N prediction), versioned so the capture thread can redraw the 3D
+    future-trajectory path only when a fresh chunk arrives instead of every
+    tick. The chunk is independent of the per-tick ``latest`` action.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._latest: "RobotAction | None" = None
         self._first_event = threading.Event()
+        self._chunk: "list[RobotAction] | None" = None
+        self._chunk_version = 0
 
     def publish(self, action: "RobotAction") -> None:
         snap = dict(action)
@@ -209,12 +241,27 @@ class ActionPublisher:
         with self._lock:
             return None if self._latest is None else dict(self._latest)
 
+    def publish_chunk(self, chunk: "list[RobotAction]") -> None:
+        """Store the latest predicted action chunk (for the 3D path viz)."""
+        snap = [dict(a) for a in chunk]
+        with self._lock:
+            self._chunk = snap
+            self._chunk_version += 1
+
+    def latest_chunk(self) -> "tuple[int, list[RobotAction] | None]":
+        """Return ``(version, chunk_copy)``; version changes on each new chunk."""
+        with self._lock:
+            if self._chunk is None:
+                return self._chunk_version, None
+            return self._chunk_version, [dict(a) for a in self._chunk]
+
     def wait_for_first(self, timeout: float) -> bool:
         return self._first_event.wait(timeout=timeout)
 
     def reset(self) -> None:
         with self._lock:
             self._latest = None
+            self._chunk = None
         self._first_event.clear()
 
 
@@ -229,6 +276,11 @@ class RolloutCaptureThread(threading.Thread):
     to Rerun, never recorded. When ``shadow`` is set the published action is
     the policy's *predicted* (unexecuted) action, logged under a distinct
     ``predicted.*`` namespace to set it apart from an executed-action run.
+
+    ``robot_viz`` (optional) adds a 3D task-space view to the Rerun stream: the
+    live robot posed by forward kinematics from the current joint state, plus
+    the predicted/commanded end-effector pose per arm. It only fires when
+    ``rerun_ip`` is set.
     """
 
     def __init__(
@@ -242,6 +294,7 @@ class RolloutCaptureThread(threading.Thread):
         task: str,
         rerun_ip: str | None,
         shadow: bool = False,
+        robot_viz: "AxolRerunRobot | None" = None,
     ) -> None:
         super().__init__(name="axol-rollout-capture", daemon=True)
         self.publisher = publisher
@@ -252,6 +305,8 @@ class RolloutCaptureThread(threading.Thread):
         self.task = task
         self.rerun_ip = rerun_ip
         self.shadow = shadow
+        self.robot_viz = robot_viz
+        self._last_chunk_version = -1
         self.stop_event = threading.Event()
 
     def run(self) -> None:
@@ -313,6 +368,29 @@ class RolloutCaptureThread(threading.Thread):
                 else:
                     log_rerun_data(observation=obs_processed, action=action)
 
+                # 3D task-space view: live robot (FK from current joints), the
+                # predicted/commanded EE pose per arm, and the predicted future
+                # trajectory path per arm (from the latest action chunk). Only
+                # pass a chunk when it changed, so the ~50-pose path FK runs once
+                # per inference, not every tick (the path persists between chunks).
+                # Best-effort — a viz hiccup must never disturb the capture loop.
+                if self.robot_viz is not None:
+                    try:
+                        left_pos, right_pos = self.robot.positions
+                        version, chunk = self.publisher.latest_chunk()
+                        new_chunk = None
+                        if chunk is not None and version != self._last_chunk_version:
+                            new_chunk = chunk
+                            self._last_chunk_version = version
+                        self.robot_viz.log_frame(
+                            left_pos=left_pos,
+                            right_pos=right_pos,
+                            action=action,
+                            action_chunk=new_chunk,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _logger.debug("3D robot viz tick %d failed: %s", tick, exc)
+
             tick += 1
 
 
@@ -334,6 +412,11 @@ class ShadowGravityCompThread(threading.Thread):
     cached joint positions, so robot telemetry must be active (it is whenever
     ``telemetry_hz > 0``, the default); a failed tick (e.g. a transient CAN
     error) is logged and the loop continues rather than killing the run.
+
+    The loop can be paused via :meth:`pause` / :meth:`resume`: while paused it
+    stops sending impedance commands so a powered return-to-rest (which drives
+    the arms with stiff position targets) isn't fought by the float loop. Pause
+    around the reset, then resume to float again from the new pose.
     """
 
     def __init__(
@@ -348,10 +431,27 @@ class ShadowGravityCompThread(threading.Thread):
         self.kd = kd
         self.rate_hz = rate_hz
         self.stop_event = threading.Event()
+        # Active by default; cleared by ``pause()`` to suspend commanding.
+        self._active = threading.Event()
+        self._active.set()
+
+    def pause(self) -> None:
+        """Stop sending gravity-comp commands (e.g. during a return-to-rest)."""
+        self._active.clear()
+
+    def resume(self) -> None:
+        """Resume gravity-comp commanding after a :meth:`pause`."""
+        self._active.set()
 
     def run(self) -> None:
         dt = 1.0 / self.rate_hz
         while not self.stop_event.is_set():
+            if not self._active.is_set():
+                # Paused: idle without commanding so a concurrent return-to-rest
+                # owns the arms. Poll the stop event so teardown stays prompt.
+                if self.stop_event.wait(timeout=0.05):
+                    return
+                continue
             loop_start = time.perf_counter()
             try:
                 self.robot.gravity_compensate(kd=self.kd)
