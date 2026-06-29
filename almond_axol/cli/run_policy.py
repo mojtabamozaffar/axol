@@ -131,6 +131,12 @@ class RunPolicyConfig:
     temporal_ensemble_coeff: float = 0.01
     rerun_ip: str | None = None
     rerun_port: int = 9876
+    # Shadow mode: the policy infers and streams its PREDICTED actions to Rerun,
+    # but the robot never actuates — neither policy actions nor the between-
+    # episode return-to-rest move the arms. Pair with --rerun_ip to watch what the
+    # policy wants to do on real observations before any powered run. No dataset is
+    # recorded in shadow mode (--repo_id is ignored).
+    shadow: bool = False
     log_level: LogLevel = "INFO"
 
 
@@ -354,6 +360,7 @@ def _build_axol_robot_client(
     publisher: ActionPublisher,
     aggregate_strategy: str = "temporal_ensemble",
     temporal_ensemble_coeff: float = 0.01,
+    shadow: bool = False,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 
@@ -365,6 +372,8 @@ def _build_axol_robot_client(
         publisher: Sink for executed actions, drained by the capture thread.
         aggregate_strategy: One of the ``--aggregate_fn`` choices.
         temporal_ensemble_coeff: Decay coefficient for temporal_ensemble.
+        shadow: If True, never call ``robot.send_action`` — publish the
+            PREDICTED action for Rerun viz instead (no actuation).
     """
     import threading as _threading
     from queue import Queue
@@ -426,6 +435,7 @@ def _build_axol_robot_client(
             publisher,
             aggregate_strategy,
             temporal_ensemble_coeff,
+            shadow=False,
         ):
             # We override the private RobotClient._aggregate_action_queues to
             # inject temporal_ensemble (no public hook can express it — see the
@@ -453,6 +463,8 @@ def _build_axol_robot_client(
                 if key.endswith("gripper.pos")
             )
             self._publisher = publisher
+            # Shadow mode: gate every send_action so the arms never move.
+            self._shadow = bool(shadow)
             self._aggregate_strategy = aggregate_strategy
             self._temporal_ensemble_coeff = float(temporal_ensemble_coeff)
             # ``(origin, packed_actions, timestamp)`` per chunk, sorted
@@ -704,12 +716,20 @@ def _build_axol_robot_client(
                 key: action_tensor[i].item()
                 for i, key in enumerate(self.robot.action_features)
             }
-            performed = self.robot.send_action(action)
+            if self._shadow:
+                # Shadow mode: NEVER actuate. Publish the PREDICTED action so the
+                # capture thread can visualize it in Rerun against current state.
+                performed = None
+                if self._publisher is not None:
+                    self._publisher.publish(action)
+            else:
+                performed = self.robot.send_action(action)
 
             if verbose:
                 self.logger.debug(
                     f"Ts={timed_action.get_timestamp()} | "
-                    f"Action #{timed_action.get_timestep()} performed | "
+                    f"Action #{timed_action.get_timestep()} "
+                    f"{'predicted (shadow)' if self._shadow else 'performed'} | "
                     f"Queue size: {qs_after}"
                 )
 
@@ -785,6 +805,7 @@ def _build_axol_robot_client(
         publisher,
         aggregate_strategy,
         temporal_ensemble_coeff,
+        shadow,
     )
 
 
@@ -837,6 +858,12 @@ def _run(
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
+    shadow = cfg.shadow
+    # Shadow mode is viz-only: a hand-guided observation paired with the policy's
+    # *unexecuted* prediction is not a meaningful rollout, so never record one.
+    if shadow and repo_id is not None:
+        log_say("Shadow mode: ignoring --repo_id (no dataset is recorded).")
+        repo_id = None
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the
@@ -1007,6 +1034,7 @@ def _run(
             publisher=publisher,
             aggregate_strategy=aggregate_fn,
             temporal_ensemble_coeff=temporal_ensemble_coeff,
+            shadow=shadow,
         )
 
         log_say("Loading policy on server (one-time)...")
@@ -1019,13 +1047,17 @@ def _run(
         # A Cartesian-action policy resolves each action to joints via IK in
         # send_action. Build that solver now, before the control loop, so its
         # one-time JIT warmup overlaps the return-to-rest + scene-reset prompt
-        # below instead of stalling the first policy action.
+        # below instead of stalling the first policy action. (Safe in shadow
+        # mode: it only builds the IK solver, it never moves the arms.)
         if getattr(robot.config, "observe_cartesian", False):
             log_say("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()
 
-        log_say("Returning to rest pose.")
-        reset_controller.return_to_rest(robot)
+        if shadow:
+            log_say("Shadow mode: not moving to rest pose (arms will not move).")
+        else:
+            log_say("Returning to rest pose.")
+            reset_controller.return_to_rest(robot)
         if not control.await_continue(
             "Reset the scene, then press Enter to start the first episode."
         ):
@@ -1062,8 +1094,10 @@ def _run(
                 daemon=True,
             )
 
+            # In shadow mode there is no dataset, but we still run the capture
+            # thread so the policy's predicted action streams to Rerun.
             capture: RolloutCaptureThread | None = None
-            if dataset is not None:
+            if dataset is not None or shadow:
                 capture = RolloutCaptureThread(
                     publisher=publisher,
                     robot=robot,
@@ -1072,6 +1106,7 @@ def _run(
                     fps=fps,
                     task=task,
                     rerun_ip=rerun_ip,
+                    shadow=shadow,
                 )
 
             control.begin_episode()
@@ -1145,8 +1180,11 @@ def _run(
                 log_say("Re-recording episode.")
                 if dataset is not None:
                     dataset.clear_episode_buffer()
-                log_say("Returning to rest pose.")
-                reset_controller.return_to_rest(robot)
+                if shadow:
+                    log_say("Shadow mode: not moving to rest pose.")
+                else:
+                    log_say("Returning to rest pose.")
+                    reset_controller.return_to_rest(robot)
                 if not control.await_continue(
                     "Reset the scene, then press Enter to start."
                 ):
@@ -1158,8 +1196,11 @@ def _run(
                 dataset.save_episode()
             episodes_recorded += 1
             log_say(f"Saved episode {episodes_recorded}.")
-            log_say("Returning to rest pose.")
-            reset_controller.return_to_rest(robot)
+            if shadow:
+                log_say("Shadow mode: not moving to rest pose.")
+            else:
+                log_say("Returning to rest pose.")
+                reset_controller.return_to_rest(robot)
             if not control.await_continue(
                 "Reset the scene, then press Enter to start the next episode."
             ):

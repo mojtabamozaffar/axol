@@ -580,6 +580,14 @@ def _recorder_main(
     config: dict,
 ) -> None:
     """Recorder subprocess entry: own the dataset, capture from shared memory."""
+    # Ignore Ctrl+C: a terminal SIGINT reaches the whole process group, but the
+    # parent drives this recorder's shutdown over the pipe (`close()` sends
+    # `("shutdown",)`). Without this it tears down on its own SIGINT — finalizing
+    # the dataset out from under the parent and racing the orchestrated stop.
+    from ..utils.signals import ignore_sigint
+
+    ignore_sigint()
+
     logging.basicConfig(level=config["log_level"])
 
     # Keep the recorder (+ its NVENC gst children, which inherit this) off the

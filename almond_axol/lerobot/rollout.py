@@ -221,6 +221,11 @@ class RolloutCaptureThread(threading.Thread):
     Each tick samples a global-timestamp-aligned observation via
     ``AxolRobot.get_observation`` and pairs it with the latest action
     published by the control loop.
+
+    ``dataset`` may be ``None`` (shadow mode): the row is then only streamed
+    to Rerun, never recorded. When ``shadow`` is set the published action is
+    the policy's *predicted* (unexecuted) action, logged under a distinct
+    ``predicted.*`` namespace to set it apart from an executed-action run.
     """
 
     def __init__(
@@ -228,11 +233,12 @@ class RolloutCaptureThread(threading.Thread):
         *,
         publisher: ActionPublisher,
         robot: "AxolRobot",
-        dataset: "LeRobotDataset",
+        dataset: "LeRobotDataset | None",
         robot_obs_proc: Callable[[Any], Any],
         fps: int,
         task: str,
         rerun_ip: str | None,
+        shadow: bool = False,
     ) -> None:
         super().__init__(name="axol-rollout-capture", daemon=True)
         self.publisher = publisher
@@ -242,6 +248,7 @@ class RolloutCaptureThread(threading.Thread):
         self.fps = fps
         self.task = task
         self.rerun_ip = rerun_ip
+        self.shadow = shadow
         self.stop_event = threading.Event()
 
     def run(self) -> None:
@@ -283,18 +290,25 @@ class RolloutCaptureThread(threading.Thread):
                 continue
 
             obs_processed = self.robot_obs_proc(obs)
-            obs_frame = build_dataset_frame(
-                self.dataset.features, obs_processed, prefix=OBS_STR
-            )
-            act_frame = build_dataset_frame(
-                self.dataset.features, action, prefix=ACTION
-            )
-            if self.stop_event.is_set():
-                return
-            self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
+            if self.dataset is not None:
+                obs_frame = build_dataset_frame(
+                    self.dataset.features, obs_processed, prefix=OBS_STR
+                )
+                act_frame = build_dataset_frame(
+                    self.dataset.features, action, prefix=ACTION
+                )
+                if self.stop_event.is_set():
+                    return
+                self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
 
             if self.rerun_ip:
-                log_rerun_data(observation=obs_processed, action=action)
+                if self.shadow:
+                    # The policy's unexecuted wish — log under action.predicted.*
+                    # so it reads distinctly from a normal executed-action run.
+                    predicted = {f"predicted.{k}": v for k, v in action.items()}
+                    log_rerun_data(observation=obs_processed, action=predicted)
+                else:
+                    log_rerun_data(observation=obs_processed, action=action)
 
             tick += 1
 
