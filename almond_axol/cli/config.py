@@ -135,7 +135,7 @@ LogLevel = register_literal(Literal["DEBUG", "INFO", "WARNING", "ERROR"])
 # only ever downscales (never upscales).
 DatasetResolution = register_literal(Literal["SVGA", "HD1080", "HD1200"])
 PolicyType = register_literal(
-    Literal["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
+    Literal["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot", "humanego_flow"]
 )
 AggregateFn = register_literal(
     Literal[
