@@ -70,12 +70,19 @@ _EE_AXES = ("x", "y", "z", "rx", "ry", "rz")
 _LEFT_EE_KEYS = [f"left_ee.{a}" for a in _EE_AXES]
 _RIGHT_EE_KEYS = [f"right_ee.{a}" for a in _EE_AXES]
 
-# Visual sizing, in metres / metres-of-axis.
-_CURRENT_RADIUS = 0.010
-_PREDICTED_RADIUS = 0.015
+# Visual sizing, in metres / metres-of-axis. Tuned large so the predicted motion
+# reads clearly against (and through) the translucent robot mesh — bump these if
+# you want it even more prominent.
+_CURRENT_RADIUS = 0.005
+_PREDICTED_RADIUS = 0.01
 _AXIS_LENGTH = 0.08
-_PATH_LINE_RADIUS = 0.004
-_PATH_POINT_RADIUS = 0.005
+_PATH_LINE_RADIUS = 0.005
+_PATH_POINT_RADIUS = 0.008
+
+# Robot mesh appearance. The link meshes are logged with a translucent light-grey
+# albedo so the bright predicted EE markers / future path show through the arms
+# instead of being occluded by them. Alpha is 0-255; lower = more see-through.
+_MESH_RGBA = (185, 195, 210, 90)
 
 
 def _resolve_mesh(filename: str, urdf_dir: Path) -> Optional[Path]:
@@ -190,6 +197,9 @@ class AxolRerunRobot:
                             vertex_normals=np.asarray(
                                 tm.vertex_normals, dtype=np.float32
                             ),
+                            # Translucent grey so the predicted EE markers / path
+                            # read through the arms instead of being occluded.
+                            albedo_factor=_MESH_RGBA,
                         ),
                         static=True,
                     )
