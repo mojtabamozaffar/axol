@@ -129,15 +129,23 @@ class RunPolicyConfig:
     server_port: int = 8765
     actions_per_chunk: int = 50
     chunk_size_threshold: float = 0.9
-    # Aggregation strategy for overlapping in-flight chunks. ``rtc`` (the
-    # default) is Real-Time Chunking: the server guides each new chunk toward the
-    # unexecuted tail of the previous one and the client simply *replaces* the
-    # queue from the current execution point, so chunks are continuous by
-    # construction and the arm never stop-starts at a boundary. ``temporal_ensemble``
-    # is the previous default (ACT Algorithm 2 blend). RTC needs a pi0/pi05 policy
-    # and an RTC-enabled server (auto-enabled for the local server; pass
-    # ``axol inference-server`` its defaults for a remote one).
-    aggregate_fn: AggregateFn = "rtc"
+    # Aggregation strategy for overlapping in-flight chunks. ``temporal_ensemble``
+    # (the default) is the ACT Algorithm 2 recency-weighted blend. ``rtc`` is
+    # Real-Time Chunking: the server guides each new chunk toward the unexecuted
+    # tail of the previous one and the client *replaces* the queue from the current
+    # execution point. RTC only pays off when the round trip is short relative to
+    # the chunk: it needs ``inference_delay + per-chunk consumption < actions_per_chunk``
+    # for its guidance to actually reach the executed actions, AND inference under
+    # ~chunk/(2*fps) to avoid genuine queue starvation (≈417 ms at fps=60,
+    # actions_per_chunk=50). Above that — e.g. pi05 on an A5000 where RTC's
+    # autograd guidance pushes inference to ~500 ms — RTC adds no runway, its
+    # guidance misses the executed region, and (unlike temporal_ensemble) it does
+    # not blend, so it is *bumpier*. Opt in with ``--aggregate_fn rtc`` only once
+    # inference is fast enough (or fps is low enough) for the conditions above.
+    # RTC also needs a pi0/pi05 policy and an RTC-enabled server (auto-enabled for
+    # the local server when rtc is selected; on by default for a remote
+    # ``axol inference-server`` but dormant unless the client sends inference_delay).
+    aggregate_fn: AggregateFn = "temporal_ensemble"
     temporal_ensemble_coeff: float = 0.01
     # --- Real-Time Chunking (RTC) tuning (only used when aggregate_fn == "rtc") ---
     # Client side: the inference delay (in control steps) sent to the server is
