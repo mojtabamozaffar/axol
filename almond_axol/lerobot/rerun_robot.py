@@ -43,7 +43,7 @@ from typing import Optional, Sequence
 import numpy as np
 import rerun as rr
 
-from ..utils.shared import (
+from ..constants import (
     ARM_JOINTS,
     URDF_PATH,
     Joint,
