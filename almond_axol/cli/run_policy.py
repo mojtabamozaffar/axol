@@ -18,6 +18,13 @@ Each episode runs until the operator types ``s`` (save), ``r`` (rerecord
 + discard), or ``q`` (quit + discard) on stdin. ``--episode_time_s`` is a
 safety cap that falls back to the same ``[Enter]=save / r / q`` prompt
 when no key has been pressed.
+
+On a clean stop (Ctrl+C or ``q``) the arms are eased to the rest pose and
+then down to the all-zeros pose via collision-aware IK trajectories before
+the motors release, so the hands descend smoothly instead of dropping (a
+second Ctrl+C aborts that move and releases immediately). After a hardware
+fault the move is skipped — commanding a faulted arm is unsafe. Mirrors
+``collect-data``'s end-of-session return-to-zero.
 """
 
 from __future__ import annotations
@@ -1278,7 +1285,44 @@ def _run(
         finally:
             if shadow_gc is not None:
                 shadow_gc.resume()
+
+    def _soft_shutdown() -> None:
+        """Ease the arms to rest, then down to zero, before the motors release.
+
+        Runs on a clean stop (Ctrl+C or quit) so the arms descend smoothly via
+        the same collision-aware IK trajectories used between episodes instead
+        of dropping the instant ``disconnect()`` disables the motors — a safety
+        hazard for anything (or anyone) under the hands. Mirrors collect-data's
+        end-of-session return-to-zero. The shadow gravity-comp loop is already
+        stopped by the time this runs, so the reset commands don't fight it.
+
+        Best-effort: a second Ctrl+C or any failure abandons the move and drops
+        straight to teardown. SIGINT is still the default handler while this
+        runs (it is set to SIG_IGN only afterwards), so a second Ctrl+C lands
+        in the handler below rather than aborting teardown.
+        """
+        if not robot.is_connected:
+            return
+        try:
+            # The arms may sit far from the last commanded pose (the policy run
+            # ended mid-motion, or the arms were hand-guided while floating in
+            # shadow mode); clear the per-step guard so the first reset waypoint
+            # isn't rejected as too large a jump.
+            robot.reset_command_state()
+            log_say("Soft shutdown: easing arms to rest pose.")
+            reset_controller.return_to_rest(robot)
+            log_say("Soft shutdown: lowering arms to zero pose.")
+            reset_controller.return_to_zero(robot)
+            log_say("Soft shutdown complete; releasing motors.")
+        except KeyboardInterrupt:
+            log_say("Soft shutdown interrupted; releasing motors now.")
+        except Exception as exc:  # noqa: BLE001 - never block teardown
+            _logger.warning("Soft shutdown move failed: %s", exc)
+
     episodes_recorded = 0
+    # Cleared to True on an unexpected error / hardware fault: the robot may be
+    # faulted and unsafe to command, so the graceful soft shutdown is skipped.
+    faulted = False
     try:
         _wait_for_port(server_host, server_port, timeout=30.0)
 
@@ -1551,22 +1595,37 @@ def _run(
 
     except KeyboardInterrupt:
         pass
+    except BaseException:
+        # Hardware fault (the re-raised control-loop error above) or any other
+        # unexpected failure: mark the robot as possibly faulted so the soft
+        # shutdown below is skipped — commanding a faulted arm is unsafe.
+        faulted = True
+        raise
     finally:
-        # Ignore SIGINT during cleanup so a second Ctrl+C can't abort
-        # partway through disconnect/teardown. Restored at end of block.
         import signal
 
+        log_say("Stopping.")
+        # Stop the shadow gravity-comp loop before any powered move / disconnect
+        # so no comp command races the soft-shutdown reset or the motor disable
+        # (disconnect engages the brakes / disables).
+        if shadow_gc is not None:
+            shadow_gc.stop_event.set()
+            shadow_gc.join(timeout=5.0)
+
+        # Soft shutdown: ease the arms to rest then zero so they descend
+        # smoothly rather than dropping when the motors release. Only on a clean
+        # stop (faulted stays False). Done while SIGINT is still the default
+        # handler so a second Ctrl+C aborts the move (see _soft_shutdown).
+        if not faulted:
+            _soft_shutdown()
+
+        # Now ignore SIGINT for the rest of cleanup so a Ctrl+C can't abort
+        # partway through disconnect/teardown. Restored at end of block.
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except (ValueError, OSError):
             pass
 
-        log_say("Stopping.")
-        # Stop the shadow gravity-comp loop before disconnect so no comp command
-        # races the motor disable (disconnect engages the brakes / disables).
-        if shadow_gc is not None:
-            shadow_gc.stop_event.set()
-            shadow_gc.join(timeout=5.0)
         if client is not None:
             try:
                 client.stop()

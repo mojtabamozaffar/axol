@@ -134,6 +134,25 @@ class IKResetController:
 
     def return_to_rest(self, robot: "AxolRobot") -> None:
         """Plan and play a collision-aware trajectory to the rest pose."""
+        self._play_to_target(robot, target="rest")
+
+    def return_to_zero(self, robot: "AxolRobot") -> None:
+        """Plan and play a collision-aware trajectory to the all-zeros arm pose.
+
+        Mirrors collect-data's end-of-session return-to-zero: the arm joints
+        are eased down to 0 (grippers left where they are) via the same
+        collision-aware IK trajectory as ``return_to_rest``, so the arms
+        descend smoothly instead of dropping the instant the motors release.
+        """
+        self._play_to_target(robot, target="zero")
+
+    def _play_to_target(self, robot: "AxolRobot", *, target: str) -> None:
+        """Plan and stream a collision-aware reset trajectory to ``target``.
+
+        ``target`` is ``"rest"`` (the worker's configured rest pose) or
+        ``"zero"`` (the current pose with both arms' joints zeroed; grippers
+        keep their current value).
+        """
         import numpy as np
 
         from ..constants import Joint
@@ -155,7 +174,16 @@ class IKResetController:
         for i, gi in enumerate(self._right_indices):
             q_current[gi] = float(pos_r[i])
 
-        self._conn.send(("reset", q_current))
+        if target == "zero":
+            # Explicit zero-arm target: the worker plans a collision-aware path
+            # to it (the 3-tuple "reset" form). Grippers stay where they are.
+            q_target = q_current.copy()
+            q_target[self._left_indices] = 0.0
+            q_target[self._right_indices] = 0.0
+            self._conn.send(("reset", q_current, q_target))
+        else:
+            # 2-tuple form: the worker returns to its configured rest pose.
+            self._conn.send(("reset", q_current))
         result = self._conn.recv()
         if not (isinstance(result, tuple) and result[0] == "reset_traj"):
             raise RuntimeError(f"Unexpected IK worker response: {result!r}")
