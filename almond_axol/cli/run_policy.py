@@ -39,7 +39,7 @@ from ..lerobot.rollout import (
     RolloutCaptureThread,
     ShadowGravityCompThread,
 )
-from .config import AggregateFn, LogLevel, PolicyType, parse
+from .config import AggregateFn, LogLevel, PolicyType, RTCSchedule, parse
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -129,8 +129,31 @@ class RunPolicyConfig:
     server_port: int = 8765
     actions_per_chunk: int = 50
     chunk_size_threshold: float = 0.9
-    aggregate_fn: AggregateFn = "temporal_ensemble"
+    # Aggregation strategy for overlapping in-flight chunks. ``rtc`` (the
+    # default) is Real-Time Chunking: the server guides each new chunk toward the
+    # unexecuted tail of the previous one and the client simply *replaces* the
+    # queue from the current execution point, so chunks are continuous by
+    # construction and the arm never stop-starts at a boundary. ``temporal_ensemble``
+    # is the previous default (ACT Algorithm 2 blend). RTC needs a pi0/pi05 policy
+    # and an RTC-enabled server (auto-enabled for the local server; pass
+    # ``axol inference-server`` its defaults for a remote one).
+    aggregate_fn: AggregateFn = "rtc"
     temporal_ensemble_coeff: float = 0.01
+    # --- Real-Time Chunking (RTC) tuning (only used when aggregate_fn == "rtc") ---
+    # Client side: the inference delay (in control steps) sent to the server is
+    # derived from measured round-trip latency, ``round_trip_s * fps``, taken as
+    # the ``rtc_delay_quantile`` of a sliding window of recent round trips (a high
+    # quantile so a single slow inference doesn't whipsaw the guidance, and so we
+    # err toward guiding slightly too much rather than too little).
+    rtc_delay_quantile: float = 0.9
+    rtc_delay_window: int = 50
+    # Server side (only applied to the auto-launched local server; for a remote
+    # server set these on ``axol inference-server`` instead). See
+    # InferenceServerConfig for the meaning of each.
+    rtc: bool = True
+    rtc_execution_horizon: int = 40
+    rtc_prefix_attention_schedule: RTCSchedule = "linear"
+    rtc_max_guidance_weight: float = 10.0
     rerun_ip: str | None = None
     rerun_port: int = 9876
     # 3D task-space Rerun view (only active with --rerun_ip): the live robot,
@@ -352,7 +375,9 @@ def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> None:
     )
 
 
-def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
+def _serve_policy_server(
+    server_cfg_dict: dict[str, Any], rtc_settings_dict: dict[str, Any]
+) -> None:
     """Entry point for the policy-server child process.
 
     Lives at module scope so it's picklable by ``mp.get_context('spawn')``.
@@ -361,14 +386,21 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
 
     Args:
         server_cfg_dict: ``PolicyServerConfig`` keyword arguments.
+        rtc_settings_dict: ``RTCServerSettings`` keyword arguments (RTC is enabled
+            on the auto-launched server by default; see ``RunPolicyConfig``).
     """
     import signal
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    from ..lerobot.inference_patch import disable_observation_similarity_filter
+    from ..lerobot.inference_patch import (
+        RTCServerSettings,
+        disable_observation_similarity_filter,
+        enable_rtc_on_policy_server,
+    )
 
     disable_observation_similarity_filter()
+    enable_rtc_on_policy_server(RTCServerSettings(**rtc_settings_dict))
 
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
@@ -388,6 +420,8 @@ def _build_axol_robot_client(
     publisher: ActionPublisher,
     aggregate_strategy: str = "temporal_ensemble",
     temporal_ensemble_coeff: float = 0.01,
+    rtc_delay_quantile: float = 0.9,
+    rtc_delay_window: int = 50,
     shadow: bool = False,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
@@ -400,6 +434,10 @@ def _build_axol_robot_client(
         publisher: Sink for executed actions, drained by the capture thread.
         aggregate_strategy: One of the ``--aggregate_fn`` choices.
         temporal_ensemble_coeff: Decay coefficient for temporal_ensemble.
+        rtc_delay_quantile: Sliding-window quantile of measured round-trip
+            latency used to estimate the RTC ``inference_delay`` (rtc only).
+        rtc_delay_window: Window size (number of recent round trips) for that
+            latency estimate (rtc only).
         shadow: If True, never call ``robot.send_action`` — publish the
             PREDICTED action for Rerun viz instead (no actuation).
     """
@@ -413,6 +451,7 @@ def _build_axol_robot_client(
         map_robot_keys_to_lerobot_features,
     )
     from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.policies.rtc.latency_tracker import LatencyTracker
     from lerobot.transport import services_pb2_grpc
     from lerobot.transport.utils import grpc_channel_options
 
@@ -463,6 +502,8 @@ def _build_axol_robot_client(
             publisher,
             aggregate_strategy,
             temporal_ensemble_coeff,
+            rtc_delay_quantile=0.9,
+            rtc_delay_window=50,
             shadow=False,
         ):
             # We override the private RobotClient._aggregate_action_queues to
@@ -495,6 +536,15 @@ def _build_axol_robot_client(
             self._shadow = bool(shadow)
             self._aggregate_strategy = aggregate_strategy
             self._temporal_ensemble_coeff = float(temporal_ensemble_coeff)
+            # RTC (aggregate_strategy == "rtc"): estimate the inference delay the
+            # server guides against from a sliding window of measured round trips
+            # (obs-capture timestamp -> chunk received). A high quantile keeps a
+            # single slow inference from whipsawing the guidance.
+            self._rtc_delay_quantile = float(rtc_delay_quantile)
+            self._latency_tracker = LatencyTracker(maxlen=int(rtc_delay_window))
+            # Throttle the periodic RTC stats log (every N received chunks).
+            self._rtc_log_every = 50
+            self._rtc_chunks_received = 0
             # ``(origin, packed_actions, timestamp)`` per chunk, sorted
             # oldest-first. ``packed_actions`` is a (chunk_size, action_dim)
             # tensor so aggregation runs as one batched op.
@@ -549,6 +599,8 @@ def _build_axol_robot_client(
             self.action_chunk_size = -1
             self.must_go.set()
             self.fps_tracker.reset()
+            self._latency_tracker.reset()
+            self._rtc_chunks_received = 0
             self.shutdown_event.clear()
             self.start_barrier = _threading.Barrier(3)
             self._race_fix_warned = False
@@ -714,8 +766,61 @@ def _build_axol_robot_client(
                 )
             self._install_future_queue(future_queue)
 
+        def _current_inference_delay(self) -> int:
+            """Estimate RTC ``inference_delay`` (control steps) from round trips.
+
+            Converts the ``rtc_delay_quantile`` of recently measured round-trip
+            latencies to steps (``latency_s * fps``) and clamps to a valid prefix
+            length. Returns 0 until the first round trip is measured — harmless,
+            because the server has no cached prefix for the first chunk anyway.
+            """
+            if len(self._latency_tracker) == 0:
+                return 0
+            latency_s = self._latency_tracker.percentile(self._rtc_delay_quantile) or 0.0
+            steps = int(round(latency_s * self.config.fps))
+            max_delay = self.config.actions_per_chunk - 1
+            return max(0, min(steps, max_delay))
+
+        def send_observation(self, obs):  # type: ignore[no-untyped-def,override]
+            """Stamp the measured RTC ``inference_delay`` on every outgoing obs.
+
+            The server reads this integer to align the previous chunk's leftover
+            prefix with the new chunk and to size the guidance window. Only the
+            rtc aggregator produces/consumes it; other strategies send a plain
+            observation (the attribute is simply absent). Pickled as a dynamic
+            instance attribute — no gRPC proto / TimedObservation change needed.
+            """
+            if self._aggregate_strategy == "rtc":
+                obs.inference_delay = self._current_inference_delay()
+            return super().send_observation(obs)
+
+        def _rtc_aggregate(self, incoming_actions):  # type: ignore[no-untyped-def]
+            """Replace the action queue with the RTC chunk from the server.
+
+            RTC returns a single, already-stitched chunk (guided toward the
+            previous chunk's unexecuted tail), so there is nothing to blend: we
+            simply install it. ``_install_future_queue`` drops every timestep
+            ``<= latest_action`` under the queue lock, which is exactly the RTC
+            queue-replacement semantic — it discards the ``inference_delay`` steps
+            already executed during the round trip and keeps the contiguous tail
+            from the current execution point forward. Because each chunk's first
+            ``inference_delay`` steps were guided to match what the robot just did,
+            the swap is continuous with no jump and no stall.
+
+            Gripper note: unlike temporal_ensemble (which averages overlapping
+            chunks and would smear the bang-bang gripper), RTC pins the new chunk
+            to a single previous trajectory that already held the discrete gripper
+            value, so no per-dim carve-out is needed.
+            """
+            if not incoming_actions:
+                return
+            future_queue = Queue()
+            for ta in sorted(incoming_actions, key=lambda a: a.get_timestep()):
+                future_queue.put(ta)
+            self._install_future_queue(future_queue)
+
         def _aggregate_action_queues(self, incoming_actions, aggregate_fn=None):  # type: ignore[no-untyped-def]
-            """Dispatch ``temporal_ensemble`` locally, else upstream scalar blends.
+            """Dispatch by strategy (rtc / temporal_ensemble / upstream blends).
 
             Also stashes the raw predicted chunk (sorted by timestep, in the
             robot's action space) on the publisher so the 3D viz can draw each
@@ -732,6 +837,29 @@ def _build_axol_robot_client(
                     for ta in sorted(incoming_actions, key=lambda a: a.get_timestep())
                 ]
                 self._publisher.publish_chunk(chunk)
+            if self._aggregate_strategy == "rtc":
+                # Round trip = now - obs-capture timestamp (the server copies the
+                # observation timestamp onto every action in the chunk). Feeds the
+                # delay estimate that the next outgoing observation carries.
+                if incoming_actions:
+                    round_trip_s = time.time() - incoming_actions[0].get_timestamp()
+                    self._latency_tracker.add(round_trip_s)
+                    self._rtc_chunks_received += 1
+                    if self._rtc_chunks_received % self._rtc_log_every == 0:
+                        with self.action_queue_lock:
+                            sizes = self.action_queue_size
+                            qmin = min(sizes) if sizes else -1
+                        _logger.info(
+                            "RTC | round-trip p%d=%.0fms est delay=%d steps | "
+                            "queue depth min=%d over last %d ticks",
+                            int(self._rtc_delay_quantile * 100),
+                            (self._latency_tracker.percentile(self._rtc_delay_quantile) or 0.0)
+                            * 1000,
+                            self._current_inference_delay(),
+                            qmin,
+                            len(sizes),
+                        )
+                return self._rtc_aggregate(incoming_actions)
             if self._aggregate_strategy == "temporal_ensemble":
                 return self._temporal_ensemble_aggregate(incoming_actions)
             return super()._aggregate_action_queues(incoming_actions, aggregate_fn)
@@ -834,6 +962,45 @@ def _build_axol_robot_client(
                     self.logger.error(f"Observation loop error: {exc!r}; continuing")
                     time.sleep(self.config.environment_dt)
 
+        def log_episode_summary(self, episode_index: int) -> None:
+            """Log queue-depth + (for rtc) latency stats for the finished episode.
+
+            A queue-depth ``min`` of 0 confirms the queue genuinely drained (the
+            stop-start symptom). The round-trip / delay readout grounds the RTC
+            ``inference_delay`` in measured data rather than a guess.
+            """
+            with self.action_queue_lock:
+                sizes = list(self.action_queue_size)
+            if sizes:
+                qmin = min(sizes)
+                qmean = sum(sizes) / len(sizes)
+            else:
+                qmin = -1
+                qmean = float("nan")
+            if self._aggregate_strategy == "rtc" and len(self._latency_tracker):
+                rt_p = (
+                    self._latency_tracker.percentile(self._rtc_delay_quantile) or 0.0
+                ) * 1000
+                _logger.info(
+                    "Episode %d stats | queue depth min=%d mean=%.1f over %d ticks "
+                    "| round-trip p%d=%.0fms | est delay=%d steps",
+                    episode_index,
+                    qmin,
+                    qmean,
+                    len(sizes),
+                    int(self._rtc_delay_quantile * 100),
+                    rt_p,
+                    self._current_inference_delay(),
+                )
+            else:
+                _logger.info(
+                    "Episode %d stats | queue depth min=%d mean=%.1f over %d ticks",
+                    episode_index,
+                    qmin,
+                    qmean,
+                    len(sizes),
+                )
+
         def stop(self) -> None:  # type: ignore[override]
             """Tear down the gRPC channel; the shared robot stays connected."""
             self.shutdown_event.set()
@@ -849,6 +1016,8 @@ def _build_axol_robot_client(
         publisher,
         aggregate_strategy,
         temporal_ensemble_coeff,
+        rtc_delay_quantile,
+        rtc_delay_window,
         shadow,
     )
 
@@ -1043,6 +1212,15 @@ def _run(
             "port": server_port,
             "fps": fps,
         }
+        # Enable RTC guidance on the child server only when the client is actually
+        # using the rtc aggregator; a temporal_ensemble run never sends an
+        # inference_delay, so the guidance would stay dormant anyway.
+        rtc_settings_dict = {
+            "enabled": cfg.rtc and aggregate_fn == "rtc",
+            "execution_horizon": cfg.rtc_execution_horizon,
+            "prefix_attention_schedule": cfg.rtc_prefix_attention_schedule,
+            "max_guidance_weight": cfg.rtc_max_guidance_weight,
+        }
         # Evict a leftover PolicyServer from a crashed/previous run before
         # spawning ours, otherwise it would bind-fail and ``_wait_for_port``
         # would silently attach to the stale (wrong-policy) server.
@@ -1052,7 +1230,7 @@ def _run(
         ctx = mp.get_context("spawn")
         server_proc = ctx.Process(
             target=_serve_policy_server,
-            args=(server_cfg_dict,),
+            args=(server_cfg_dict, rtc_settings_dict),
             name="axol-policy-server",
             daemon=True,
         )
@@ -1097,9 +1275,15 @@ def _run(
         _wait_for_port(server_host, server_port, timeout=30.0)
 
         # ``RobotClientConfig`` requires a name from upstream's registry;
-        # ``temporal_ensemble`` is handled in our override so pass a
+        # ``rtc`` / ``temporal_ensemble`` are handled in our override so pass a
         # placeholder that the dispatcher short-circuits.
-        if aggregate_fn == "temporal_ensemble":
+        if aggregate_fn == "rtc":
+            log_say(
+                f"Aggregation: rtc (Real-Time Chunking; queue replacement, "
+                f"delay p{int(cfg.rtc_delay_quantile * 100)} from measured "
+                f"round trips)."
+            )
+        elif aggregate_fn == "temporal_ensemble":
             log_say(
                 f"Aggregation: temporal_ensemble "
                 f"(coeff={temporal_ensemble_coeff:+.3f}, ACT default 0.01)."
@@ -1118,7 +1302,9 @@ def _run(
             chunk_size_threshold=chunk_size_threshold,
             fps=fps,
             aggregate_fn_name=(
-                "latest_only" if aggregate_fn == "temporal_ensemble" else aggregate_fn
+                "latest_only"
+                if aggregate_fn in ("temporal_ensemble", "rtc")
+                else aggregate_fn
             ),
         )
         publisher = ActionPublisher()
@@ -1128,6 +1314,8 @@ def _run(
             publisher=publisher,
             aggregate_strategy=aggregate_fn,
             temporal_ensemble_coeff=temporal_ensemble_coeff,
+            rtc_delay_quantile=cfg.rtc_delay_quantile,
+            rtc_delay_window=cfg.rtc_delay_window,
             shadow=shadow,
         )
 
@@ -1275,6 +1463,13 @@ def _run(
             control_thread.join(timeout=5.0)
             receiver_thread.join(timeout=5.0)
             obs_thread.join(timeout=5.0)
+
+            # Phase-0 instrumentation: queue-depth + (rtc) latency readout so a
+            # starving queue (min=0) and the measured inference delay are visible.
+            try:
+                client.log_episode_summary(episodes_recorded + 1)
+            except Exception:  # noqa: BLE001
+                pass
 
             if interrupted or stop_event.is_set():
                 if dataset is not None:

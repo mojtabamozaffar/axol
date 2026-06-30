@@ -139,6 +139,7 @@ PolicyType = register_literal(
 )
 AggregateFn = register_literal(
     Literal[
+        "rtc",
         "temporal_ensemble",
         "weighted_average",
         "latest_only",
@@ -146,6 +147,11 @@ AggregateFn = register_literal(
         "conservative",
     ]
 )
+# Prefix-attention schedule for Real-Time Chunking guidance. Lower-cased
+# mirror of LeRobot's ``RTCAttentionSchedule`` enum (LINEAR/EXP/ONES/ZEROS),
+# converted to the enum on the server. LINEAR is the upstream default and the
+# smoothest handoff for high-latency inference.
+RTCSchedule = register_literal(Literal["linear", "exp", "ones", "zeros"])
 
 
 # ----------------------------------------------------------------------
