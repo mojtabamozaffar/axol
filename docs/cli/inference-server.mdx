@@ -26,6 +26,17 @@ axol run-policy --server_host <server-ip> --policy_path myorg/pick-place-policy 
 | `--fps INT` | Action chunk rate (default: 60). Must match `run-policy`'s `--fps`. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
+## pi05 latency knobs
+
+When the client serves a **pi05** policy, the server applies latency optimizations measured on an RTX A5000 (milano_side ckpt): the raw forward is ~494 ms; the defaults bring it to **~300 ms** (median 297, 1.65×). Other policy types are unaffected. See `almond_axol/lerobot/pi05_inference_opt.py` and benchmark with `python -m almond_axol.diagnostics.bench_pi05 --sweep --breakdown`.
+
+| Flag | Description |
+|---|---|
+| `--vision_bf16 BOOL` | Run the SigLIP vision tower in bf16 (default: `true`). ≈-70 ms; `max\|Δ\|≈1e-2` vs fp32 (the rest of the model is already bf16). |
+| `--cheap_kv_cache BOOL` | Replace pi05's per-denoise-step KV-cache deepcopy with a shallow clone (default: `true`). ≈-13 ms, **bit-identical** output. |
+| `--num_inference_steps INT` | Flow-matching denoise steps (**default: `6`**; the checkpoint trained at 10). Lower = faster but coarser: `6` ≈ ~300 ms (`max\|Δ\|≈5e-2` vs 10), `5` ≈ ~284 ms, `10` = trained fidelity (~406 ms). **Validate a reduction in `run-policy --shadow` before a powered run.** |
+| `--compile BOOL` | `torch.compile` (CUDA graphs) the denoise loop (default: `false`). Cuts per-step launch overhead but adds minutes of first-inference warm-up — opt-in/experimental. |
+
 <Note>
   Requires the `lerobot` extra and, for GPU inference, the `cuda` extra plus a CUDA-capable PyTorch install on the server machine. Without `--server_host`, `run-policy` spawns its own local `PolicyServer` child process — this command is only needed when inference runs on a different machine.
 </Note>
