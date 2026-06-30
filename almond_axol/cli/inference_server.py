@@ -58,6 +58,26 @@ class InferenceServerConfig:
                    smoothest and the upstream default.
         rtc_max_guidance_weight: Upper clamp on the per-step guidance weight.
         log_level: Python logging level.
+
+    pi05 latency knobs (see ``almond_axol.lerobot.pi05_inference_opt`` and
+    ``python -m almond_axol.diagnostics.bench_pi05``). On an RTX A5000 the pi05
+    forward is ~494 ms; the defaults below bring it to ~300 ms (median 297,
+    1.65x). They apply only when the client serves a pi05 policy; other policy
+    types are untouched.
+
+        vision_bf16:         Run the SigLIP vision tower in bf16 (≈-70 ms,
+                             max|Δ|≈1e-2 vs fp32; rest of the model is bf16).
+        cheap_kv_cache:      Replace pi05's per-denoise-step KV-cache deepcopy
+                             with a shallow clone (≈-13 ms, bit-identical).
+        num_inference_steps: Flow-matching denoise steps (default 6; the
+                             checkpoint trained at 10). Lower = faster but
+                             coarser — 6 trades max|Δ|≈5e-2 vs 10 for ~90 ms; set
+                             10 for trained fidelity, 5 (~284 ms) for more speed.
+                             Validate a reduction in ``run-policy --shadow``
+                             before a powered run.
+        compile:             torch.compile (CUDA graphs) the denoise loop. Cuts
+                             per-step launch overhead but adds first-inference
+                             warm-up; opt-in.
     """
 
     host: str = "0.0.0.0"
@@ -68,6 +88,10 @@ class InferenceServerConfig:
     rtc_prefix_attention_schedule: RTCSchedule = "linear"
     rtc_max_guidance_weight: float = 10.0
     log_level: LogLevel = "INFO"
+    vision_bf16: bool = True
+    cheap_kv_cache: bool = True
+    num_inference_steps: int | None = 6
+    compile: bool = False
 
 
 def main(argv: list[str]) -> None:
@@ -91,6 +115,15 @@ def main(argv: list[str]) -> None:
         )
     )
 
+    from ..lerobot.pi05_inference_opt import enable_pi05_inference_optimizations
+
+    enable_pi05_inference_optimizations(
+        vision_bf16=cfg.vision_bf16,
+        cheap_kv_cache=cfg.cheap_kv_cache,
+        num_inference_steps=cfg.num_inference_steps,
+        compile=cfg.compile,
+    )
+
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 
@@ -101,9 +134,7 @@ def main(argv: list[str]) -> None:
     # bind. lerobot owns the socket once ``serve`` takes over.
     reclaim_port(cfg.port)
 
-    _logger.info(
-        "Serving policy inference on %s:%d (Ctrl+C to stop).", cfg.host, cfg.port
-    )
+    _logger.info("Serving policy inference on %s:%d (Ctrl+C to stop).", cfg.host, cfg.port)
     try:
         serve(PolicyServerConfig(host=cfg.host, port=cfg.port, fps=cfg.fps))
     except KeyboardInterrupt:
